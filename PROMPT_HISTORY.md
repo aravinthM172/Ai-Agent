@@ -112,3 +112,19 @@ check README/PROMPT_HISTORY accuracy and note this step here.
    `README.md` (live URL, subdomain requirement, the streaming workaround)
    and `.dev.vars.example` (wrangler reads the token from `.env`, not
    `.dev.vars`).
+
+**User (follow-up):**
+> i typed once it sending sam msg again again
+
+**Claude Code:** Read the live chat history and found the agent looping. The user had sent a message without a real job posting or resume. Llama then alternated between `compareJobToProfile` and `saveResumeProfile` until the 20-step limit, and saved an invented placeholder as the resume. Testing the model outside the Durable Object showed:
+- Llama repeats a tool much less often when the tool returns a plain-English confirmation instead of JSON like `{ saved: true }`.
+- Removing tools (`activeTools`) or forcing `toolChoice: "none"` doesn't stop Llama. With tool calls still in the history, it either keeps calling the tools or prints the calls as JSON.
+- `workers-ai-provider` sends `tools: []` for tool-less steps, which Workers AI rejects.
+- The provider defaults to `max_tokens: 256`.
+
+Fixes, deployed and re-tested live with the same message:
+- Save tools return plain-text results.
+- `saveJobNote` upserts instead of duplicating.
+- The resume and job-description tools refuse input that is missing or invented.
+- After a repeated call or 3 tool rounds, a final step with no tools and no tool-call history makes the model answer in plain text.
+- The binding wrapper omits empty `tools` arrays, and `maxOutputTokens` is set to 1024.

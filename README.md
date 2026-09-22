@@ -62,9 +62,18 @@ npm run deploy
 
 This runs `vite build && wrangler deploy`, which needs a Cloudflare account with Workers enabled (`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, or an interactive `wrangler login`).
 
-## Known issue: duplicated Workers AI stream deltas
+## Workarounds for Llama 3.3 / Workers AI quirks
 
-Workers AI's streaming responses for Llama 3.3 currently include each delta twice per SSE chunk — in OpenAI-style `choices[0].delta` and in the legacy top-level `response` / `tool_calls` fields. `workers-ai-provider` 3.x reads both, which corrupts streamed tool-call arguments so every tool call fails validation. `src/server.ts` wraps the `AI` binding (`dedupeStreamChunks`) to strip the legacy fields before the provider sees them. This can be removed once the project moves to a provider version that handles the new format (4.x requires `ai` v7).
+`src/server.ts` contains a few deliberate workarounds, found while testing the deployed agent:
+
+- **Duplicated stream deltas.** Workers AI streams for Llama 3.3 now include each delta twice per SSE chunk (in `choices[0].delta` and in the legacy top-level `response` / `tool_calls` fields). `workers-ai-provider` 3.x reads both, corrupting tool-call arguments so every tool call fails. `fixWorkersAIBinding` strips the legacy fields. It also drops the empty `tools: []` array the provider sends for tool-less steps, which Workers AI rejects. Both can go once the project moves to a provider version that handles this (4.x requires `ai` v7).
+- **Repeated tool calls.** Llama 3.3 tends to call tools again and again, and even invented placeholder data (e.g. saved "Please share your resume…" as the resume). Mitigations:
+  - Save tools return plain-English confirmations instead of JSON flags.
+  - `saveJobNote` updates an existing company + role instead of duplicating it.
+  - `saveResumeProfile` refuses text that isn't grounded in the user's message.
+  - `compareJobToProfile` refuses a missing or too-short job description.
+  - After a repeated call or 3 tool rounds, a final tool-free step makes the model answer in plain text.
+- **Output length.** The provider defaults to 256 output tokens, which truncated comparisons; `maxOutputTokens` is set to 1024.
 
 ## AI-assisted development
 
