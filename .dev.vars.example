@@ -1,0 +1,4 @@
+# Copy this file to .dev.vars and fill in your own value.
+# Needed for `npm run dev` (Workers AI has no local simulator, so dev mode
+# proxies to your real Cloudflare account) and for `npm run deploy`.
+CLOUDFLARE_API_TOKEN=your-api-token-here
