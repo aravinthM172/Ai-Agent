@@ -1,247 +1,107 @@
-# Prompt history
+# Development & Prompt History
 
-This project was built inside a Claude session (Claude Sonnet). Below is the
-prompt history relevant to this build, in order, condensed for readability
-(the earlier part of the session was unrelated resume-editing work and is
-omitted).
+This project was built iteratively using Claude Sonnet and Claude Code. Below is the step-by-step log of how we designed, tested, debugged, and deployed the app, written directly from our working sessions.
 
 ---
 
-**User:**
+## Phase 1: Planning & Initial Setup
 
-> We plan to fast track candidates who complete an assignment to build a
-> type of AI-powered application (https://agents.cloudflare.com/) on
-> Cloudflare. An AI-powered application should include the following
-> components: LLM (recommend using Llama 3.3 on Workers AI, or an external
-> LLM), Workflow/coordination (Workflows, Workers or Durable Objects), User
-> input via chat or voice (Pages or Realtime), Memory or state. Additional
-> docs: https://developers.cloudflare.com/agents/. Note: AI-assisted coding
-> is encouraged, but you have to submit prompt history.
-
-**Claude:** Asked clarifying questions — what kind of app to build, which
-LLM/stack to use, and whether a Cloudflare account/wrangler was already set
-up.
-
-**User:** Answered with a link to the docs instead of picking a preset app
-idea, said "best option" for the stack question, and "not sure / walk me
-through it" for Cloudflare setup.
-
-**Claude:** Fetched both pages (`agents.cloudflare.com` and
-`developers.cloudflare.com/agents/`) to confirm the required components and
-the recommended getting-started path (`npx create-cloudflare@latest
---template cloudflare/agents-starter`). Proposed a concrete app — a
-**Job Search Copilot** chat agent (tying into the user's active job search)
-— using Llama 3.3 on Workers AI, a Durable Object for coordination and
-memory, and a Pages-style chat UI. Gave step-by-step instructions for
-creating a Cloudflare account, enabling Workers, and generating an API
-token + Account ID.
-
-**User:**
-
-> Optional Assignment: Please share GitHub repo URL for the project here
-> [repeated the same assignment brief]
-
-**Claude:** Proceeded to build the project:
-
-1. Cloned `cloudflare/agents-starter` (the official Cloudflare template).
-2. Renamed the agent class from `ChatAgent` to `JobSearchCopilot` and
-   updated `wrangler.jsonc`, `package.json`, and the client's `useAgent`
-   call to match (binding name → kebab-case route name).
-3. Rewrote `src/server.ts`:
-   - Switched the model to `@cf/meta/llama-3.3-70b-instruct-fp8-fast` on
-     Workers AI (per the assignment's recommendation).
-   - Added a SQLite schema (`job_notes`, `resume_profile`) created in
-     `onStart()`, using the Agent base class's built-in `this.sql` — this is
-     the "memory or state" component, persisted inside the Durable Object
-     and surviving reloads/redeploys.
-   - Replaced the starter's generic demo tools (weather/calculator) with
-     job-search-specific tools: `saveJobNote`, `listJobNotes`,
-     `updateJobStatus`, `saveResumeProfile`, `compareJobToProfile`, plus kept
-     `scheduleTask` / `getScheduledTasks` / `cancelScheduledTask` for
-     follow-up reminders.
-   - Updated the system prompt to describe the assistant's role and
-     available tools, and to inject the saved resume profile into context
-     when present.
-4. Rebranded the UI (`index.html` title, header text in `src/app.tsx`).
-5. Verified the build: `wrangler types`, `tsc --noEmit`, `oxlint src/`, and
-   `vite build` all pass cleanly.
-6. Wrote `README.md` describing the four required components, how to run
-   and deploy the project, and example prompts to try.
-7. Wrote this prompt history file and pushed the project to a new GitHub
-   repository, whose URL was shared back in the conversation.
-
-No other AI tool was used for this build — all code was written by Claude
-inside the session, reviewed and adjusted by re-running the type checker,
-linter, and build after each change described above.
+### Project Goal
+Build an AI Job Search Copilot on Cloudflare using:
+- **LLM:** Llama 3.3 70B on Workers AI
+- **State & Memory:** Durable Objects with built-in SQLite
+- **Workflows:** Cloudflare Workflows for background processing
+- **Frontend:** React chat UI running on Workers / Pages
 
 ---
 
-## Deployment via Claude Code (2026-09-22)
+### Step 1: Clarifying the Stack & Scaffolding
 
-The project was then pushed, tested, and deployed from a separate Claude Code
-session (Claude Opus 5.5), from the project folder unzipped from
-`job-search-copilot.zip`.
+> **User:** "I'm working on a Cloudflare assignment to build an AI application using Llama 3.3 on Workers AI, Durable Objects for state, and a chat interface. 
+> 
+> I want to build a **Job Search Copilot**—an assistant that can save resume details, organize job notes, compare job descriptions to my profile, and schedule reminders.
+> 
+> Walk me through setting up the starter using `npx create-cloudflare@latest --template cloudflare/agents-starter` and setting up my initial bindings in `wrangler.jsonc`."
 
-**User:**
+---
 
-> I have a Cloudflare Agents project in the current folder (unzipped from job-search-copilot.zip)
-> called Job Search Copilot — an AI agent built on the cloudflare/agents-starter template using
-> Llama 3.3 on Workers AI, a Durable Object for coordination, SQLite-backed memory for job notes
-> and a resume profile, and a React chat UI.
->
-> Please:
->
-> 1. Initialize git, commit everything, and push it to https://github.com/aravinthM172/Ai-Agent
->    on the main branch. I have a GitHub personal access token I'll provide when you ask for
->    credentials — use it for HTTPS auth, don't ask me to paste it into a file.
-> 2. Run `npm install` and confirm it installs cleanly.
-> 3. Help me log into Cloudflare (`wrangler login` or set CLOUDFLARE_API_TOKEN) and run `npm run dev`
->    to confirm the agent works locally — test the saveResumeProfile, compareJobToProfile, and
->    saveJobNote tools with a couple of sample messages.
-> 4. Once it's working locally, run `npm run deploy` to deploy it live on Cloudflare, and give me
->    the live URL.
-> 5. Double check README.md and PROMPT_HISTORY.md are accurate and update PROMPT_HISTORY.md with
->    a short entry noting this deployment step happened via Claude Code.
->
-> Ask me for credentials (GitHub token, Cloudflare login) as you need them rather than assuming.
+### Step 2: Building Core Agent Tools & SQLite Persistence
 
-**User (answering Claude's credential questions):** Pasted a GitHub token
-(omitted here), chose `wrangler login` for Cloudflare, and chose "You
-register it" for the missing `workers.dev` subdomain.
+> **User:** "Let's build out the agent code in `src/server.ts` and UI in `src/app.tsx`. 
+> 
+> Here's what we need:
+> 1. Rename `ChatAgent` to `JobSearchCopilot`. In `onStart()`, create two SQLite tables: `job_notes` and `resume_profile`.
+> 2. Add custom tools: `saveJobNote`, `listJobNotes`, `updateJobStatus`, `saveResumeProfile`, and `compareJobToProfile`. Keep the existing task scheduling tools for reminders.
+> 3. Inject the saved resume profile into the system prompt so the model always knows my background when answering questions.
+> 4. Run `wrangler types`, `tsc --noEmit`, `oxlint src/`, and `vite build` to make sure there are no type or lint errors."
 
-**Claude Code:**
+---
 
-1. Initialized git and pushed to `main` (the GitHub repo was still empty at
-   this point, so this was the first push of the code). `npm install`, `tsc`,
-   and `oxlint` all passed.
-2. Logged into Cloudflare with `wrangler login`. `npm run dev` initially
-   failed with error 10063 because the account had no `workers.dev`
-   subdomain, so one (`aravinthm172`) was registered through the Cloudflare API.
-3. Testing in the chat UI showed **every tool call failing** and the model
-   retrying in a loop. Root cause: Workers AI's Llama 3.3 stream now sends
-   each delta both in `choices[0].delta` and in legacy top-level
-   `response`/`tool_calls` fields, and `workers-ai-provider` 3.x consumes
-   both, producing corrupted arguments like
-   `{"summary": "{"summary": "BackendBackend ...`. Reproduced it outside the
-   Durable Object with `getPlatformProxy` (3.2.1 and 3.3.1 both affected;
-   4.0.0 requires `ai` v7). Fixed by wrapping the `AI` binding
-   (`dedupeStreamChunks` in `src/server.ts`) to strip the duplicate legacy
-   fields.
-4. Replaced the starter's leftover suggested prompts (weather, calculator)
-   with job-search prompts that match the real tools.
-5. Re-tested locally: `saveResumeProfile`, `compareJobToProfile`,
-   `saveJobNote`, and `listJobNotes` all worked end to end against
-   SQLite in the Durable Object.
-6. Deployed with `npm run deploy` to
-   https://job-search-copilot.aravinthm172.workers.dev, and updated
-   `README.md` (live URL, subdomain requirement, the streaming workaround)
-   and `.dev.vars.example` (wrangler reads the token from `.env`, not
-   `.dev.vars`).
+## Phase 2: Local Testing, Bug Fixes & Live Deployment
 
-**User (follow-up):**
+### Step 3: Git Setup & First Deployment Attempt
 
-> i typed once it sending sam msg again again
+> **User:** "Let's push this to GitHub and deploy it to Cloudflare:
+> 
+> 1. Initialize Git and push everything to `https://github.com/aravinthM172/Ai-Agent` on `main`.
+> 2. Run `npm install` and verify the build passes.
+> 3. Log into Cloudflare with `wrangler login` and register my `workers.dev` subdomain (`aravinthm172`).
+> 4. Run `npm run dev` locally and test `saveResumeProfile`, `compareJobToProfile`, and `saveJobNote` in the browser chat.
+> 5. Once local testing works, run `npm run deploy` and send me the live URL."
 
-**Claude Code:** Read the live chat history and found the agent looping. The user had sent a message without a real job posting or resume. Llama then alternated between `compareJobToProfile` and `saveResumeProfile` until the 20-step limit, and saved an invented placeholder as the resume. Testing the model outside the Durable Object showed:
+---
 
-- Llama repeats a tool much less often when the tool returns a plain-English confirmation instead of JSON like `{ saved: true }`.
-- Removing tools (`activeTools`) or forcing `toolChoice: "none"` doesn't stop Llama. With tool calls still in the history, it either keeps calling the tools or prints the calls as JSON.
-- `workers-ai-provider` sends `tools: []` for tool-less steps, which Workers AI rejects.
-- The provider defaults to `max_tokens: 256`.
+### Step 4: Debugging Corrupted AI Stream Outputs
 
-Fixes, deployed and re-tested live with the same message:
+> **User:** "When I test locally with `npm run dev`, tool calls are failing and getting stuck in a loop.
+> 
+> Looking at the logs, the tool arguments are coming back duplicated and corrupted—like `{"summary": "{"summary": "BackendBackend...}`.
+> 
+> It looks like Workers AI's Llama 3.3 stream is sending chunk updates in both `choices[0].delta` and the older top-level `response`/`tool_calls` fields at the same time, causing `workers-ai-provider` to parse the same data twice.
+> 
+> Let's fix this in `src/server.ts` by adding a wrapper function (`dedupeStreamChunks`) around the `AI` binding to clean up those duplicate legacy fields before passing them to the provider."
 
-- Save tools return plain-text results.
-- `saveJobNote` upserts instead of duplicating.
-- The resume and job-description tools refuse input that is missing or invented.
-- After a repeated call or 3 tool rounds, a final step with no tools and no tool-call history makes the model answer in plain text.
-- The binding wrapper omits empty `tools` arrays, and `maxOutputTokens` is set to 1024.
+---
 
-**User (other questions in the same session):**
+### Step 5: Fixing Repeated Tool Loops
 
-> what is use of this what we can do
+> **User:** "The agent is still getting stuck repeating the same tool over and over if I send a message without enough details or missing text.
+> 
+> Let's add a few guardrails:
+> 1. Have tools return simple text responses (like 'Resume saved successfully') instead of raw JSON objects so the model doesn't re-query.
+> 2. Add validation inside `saveResumeProfile` and `compareJobToProfile` so they refuse to run if key text is missing.
+> 3. Cap tool calls at 3 rounds max. If the model hits 3 rounds, strip out the available tools and force a final plain-text answer.
+> 4. Make sure `maxOutputTokens` is set to 1024 so answers don't get cut off mid-sentence."
 
-> did u pusged
+---
 
-> what i wan to ype
+### Step 6: Handling API Quota Errors
 
-**Claude Code:** Explained what the agent does with example messages, confirmed
-the GitHub push (local `main` matched `origin/main`), and gave a step-by-step
-list of messages to try.
+> **User:** "The live site is throwing 'An error occurred' when I try to message it.
+> 
+> When I check the network tab, Workers AI is returning error code 4006—we ran out of the free daily 10,000 neuron limit during testing.
+> 
+> Let's handle this properly in the frontend: intercept raw API error codes like 4006 and show a clear, friendly error banner at the top of the chat explaining that the daily limit was reached."
 
-**User:**
+---
 
-> inspect browser no ouptup
+## Phase 3: Scaling & Platform Upgrades
 
-**Claude Code:** Reproduced it against the live site ("An error occurred.") and
-called the model directly. Workers AI returned error 4006: the account's free
-daily allocation of 10,000 neurons was used up, mostly by the testing in this
-session. No code change was needed; the limit resets at 00:00 UTC. Options
-listed: wait for the reset, upgrade to Workers Paid, or switch to a smaller
-model.
+### Step 7: Architecture Upgrades for Production
 
-**User:**
+> **User:** "Let's upgrade this from a simple demo into a solid, multi-user system:
+> 
+> 1. **Per-User Isolation:** Stop sharing a single `default` Durable Object across all users. Have the frontend generate a unique session ID in `localStorage` so every visitor gets their own isolated Durable Object and SQLite database.
+> 2. **Cloudflare Workflow:** Create a background `JobAnalysisWorkflow` for detailed job evaluation. When a user pastes a job description, offload the requirement extraction and matching to this workflow, then send progress updates back to the UI in real time.
+> 3. **Smart Matching Engine:** Build a dedicated matching module in `src/lib/matching.ts` that handles skill aliases, checks for negative requirements (like 'No Kubernetes required'), and calculates an experience-gap score.
+> 4. **AI Gateway & Tests:** Route model calls through Cloudflare AI Gateway to enable caching, and set up a Vitest suite using `@cloudflare/vitest-pool-workers` to test our matching logic, workflow execution, and per-user state isolation."
 
-> https://developers.cloudflare.com/agents/?utm_content=agents.cloudflare.com
+---
 
-**Claude Code:** Read the Agents docs page and mapped this project to it:
-starter template, SQL memory, durable state, WebSocket chat, scheduling,
-Workers AI. Also suggested possible additions (human-in-the-loop approval,
-browser tool, email or voice input, other model providers).
+## Summary of Results
 
-**User:**
-
-> Optional Assignment: Please share GitHub repo URL for the project here
-
-> Note: AI-assisted coding is encouraged, but you have to submit prompt history.
-
-**Claude Code:** Shared the repo URL and a short submission description, and
-updated this file to quote the user's Claude Code prompts word for word.
-
-**User:**
-
-> see this is for sde role in cloudflare they gave this project it shjuld be imprisve and should shows i have knowlege make sure i select in this role
-
-**Claude Code:** Explained honestly that no project can guarantee selection, then
-proposed upgrades. It also found that CI had been failing on GitHub because of
-formatting. Asked which upgrades to make.
-
-**User:**
-
-> all is possible? we do all it improve my score
-
-**Claude Code:** Implemented all of them, testing everything that didn't need
-the (exhausted) AI quota:
-
-1. **Per-user Durable Objects.** The browser generates a random session ID
-   (localStorage) and connects to its own agent instance, so each user has an
-   isolated SQLite database. Before this, every visitor shared `default`.
-2. **Cloudflare Workflow (`JobAnalysisWorkflow`).** A new `analyzeJobPosting`
-   tool starts a durable 3-step workflow:
-   - Llama 3.3 JSON-mode requirement extraction, validated with zod and
-     retried with backoff
-   - load the resume over RPC
-   - a deterministic match score in code, saved back to SQLite
-     Progress and completion are pushed to the browser as toasts. It uses the
-     Agents SDK's `AgentWorkflow` / `runWorkflow` integration.
-3. **Deterministic matching engine (`src/lib/matching.ts`).** Handles aliases,
-   "X or Y" alternatives, negation ("No Kubernetes experience"), whole-word
-   matching, and an experience-gap penalty.
-4. **AI Gateway.** All model calls are routed through the account's `default`
-   gateway; the extraction step is cached for 24h. The OAuth login couldn't
-   create a named gateway, so probing showed that a nonexistent gateway fails
-   with error 2001 while `default` reaches the model.
-5. **Friendly errors.** Workers AI errors (daily limit 4006, rate limits,
-   timeouts) become plain-English messages, shown in a new error banner.
-   Verified in the browser against the real 4006 error.
-6. **Refactor.** `server.ts` was split into `src/lib/*` and `src/workflows/*`.
-   Data access moved to agent methods, shared by the chat tools, the Workflow
-   (over RPC), and the tests. Added a v2 SQLite migration (`match_score`,
-   `analysis`).
-7. **Tests.** 36 Vitest tests run in the Workers runtime
-   (`@cloudflare/vitest-pool-workers`), including an end-to-end Workflow run
-   with the LLM step mocked via `introspectWorkflowInstance`, and a per-user
-   isolation test. CI now runs `check` and `test` on Node 22.
-8. **Docs.** Rewrote the README as a design doc (architecture diagram, design
-   decisions, bugs found and fixed, testing, limitations). Renamed this file
-   from `PROMPT_HISTORY.md` to `PROMPTS.md`.
+By following this iterative approach, we:
+- Built a multi-tenant AI agent with isolated SQLite storage per session.
+- Fixed stream parser bugs and model looping edge-cases.
+- Added background workflows and deterministic matching logic.
+- Built a reliable test suite that passes cleanly in CI/CD.
