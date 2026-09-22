@@ -7,154 +7,63 @@ import {
   pruneMessages,
   stepCountIs,
   streamText,
-  tool,
-  type ModelMessage,
-  type StepResult,
-  type ToolSet
+  tool
 } from "ai";
 import { z } from "zod";
+import {
+  hasRepeatedToolCall,
+  summarizeToolResults,
+  withoutToolParts,
+  wordOverlap
+} from "./lib/guardrails";
+import type { JobRequirements, MatchResult } from "./lib/matching";
+import {
+  CHAT_MODEL,
+  fixWorkersAIBinding,
+  friendlyAIError
+} from "./lib/workers-ai";
+import type {
+  JobAnalysisParams,
+  JobAnalysisResult
+} from "./workflows/job-analysis";
 
-/**
- * Wraps the Workers AI binding to work around two incompatibilities between
- * workers-ai-provider 3.x and the current Workers AI API:
- *
- * 1. Llama 3.3 streams now send every delta twice per SSE chunk: once in
- *    OpenAI-style `choices[0].delta` and again in the legacy top-level
- *    `response` / `tool_calls` fields. The provider reads both, which doubles
- *    text and corrupts streamed tool-call arguments (e.g.
- *    `{"summary": "{"summary": "BackendBackend ...`), so every tool call
- *    fails validation. We drop the legacy fields whenever `choices` is
- *    present, leaving a single copy of each delta.
- * 2. For a step with no active tools the provider sends `tools: []`, which
- *    Workers AI rejects ("`tools` must not be an empty array"). We omit
- *    `tools` / `tool_choice` in that case.
- */
-function fixWorkersAIBinding(ai: Ai): Ai {
-  const fixLine = (line: string) => {
-    if (!line.startsWith("data: ")) return line;
-    try {
-      const chunk = JSON.parse(line.slice(6));
-      if (!Array.isArray(chunk.choices)) return line;
-      delete chunk.response;
-      delete chunk.tool_calls;
-      return `data: ${JSON.stringify(chunk)}`;
-    } catch {
-      return line; // e.g. "data: [DONE]"
-    }
-  };
+export { JobAnalysisWorkflow } from "./workflows/job-analysis";
 
-  return new Proxy(ai, {
-    get(target, prop, receiver) {
-      if (prop !== "run") return Reflect.get(target, prop, receiver);
-      return async (...args: Parameters<Ai["run"]>) => {
-        const inputs = args[1] as Record<string, unknown> | undefined;
-        if (Array.isArray(inputs?.tools) && inputs.tools.length === 0) {
-          const { tools: _tools, tool_choice: _toolChoice, ...rest } = inputs;
-          args[1] = rest as (typeof args)[1];
-        }
-        const result: unknown = await target.run(...args);
-        if (!(result instanceof ReadableStream)) return result;
+export const JOB_STATUSES = [
+  "saved",
+  "applied",
+  "interviewing",
+  "offer",
+  "rejected"
+] as const;
+export type JobStatus = (typeof JOB_STATUSES)[number];
 
-        const decoder = new TextDecoder();
-        const encoder = new TextEncoder();
-        let buffer = "";
-        return result.pipeThrough(
-          new TransformStream<Uint8Array, Uint8Array>({
-            transform(bytes, controller) {
-              buffer += decoder.decode(bytes, { stream: true });
-              const lines = buffer.split("\n");
-              buffer = lines.pop() ?? "";
-              for (const line of lines) {
-                controller.enqueue(encoder.encode(`${fixLine(line)}\n`));
-              }
-            },
-            flush(controller) {
-              if (buffer) controller.enqueue(encoder.encode(fixLine(buffer)));
-            }
-          })
-        );
-      };
-    }
-  });
-}
-
-// Words that say nothing about a person's experience, so they don't count
-// when checking whether a resume summary came from the user's own text.
-const FILLER_WORDS = new Set(
-  "please paste share your yours resume profile summary save saved actual real compare with this that here job description posting match about skills".split(
-    " "
-  )
-);
-
-/**
- * Fraction of `text`'s meaningful words (4+ letters, not filler) that also
- * appear in `source`. Returns 0 when `text` has no meaningful words.
- */
-function wordOverlap(text: string, source: string): number {
-  const words = (s: string) =>
-    (s.toLowerCase().match(/[a-z0-9+#.]{4,}/g) ?? []).filter(
-      (w) => !FILLER_WORDS.has(w)
-    );
-  const sourceWords = new Set(words(source));
-  const textWords = words(text);
-  if (textWords.length === 0) return 0;
-  return textWords.filter((w) => sourceWords.has(w)).length / textWords.length;
-}
-
-/** True if some identical tool call (name + input) appears more than once. */
-function hasRepeatedToolCall<T extends ToolSet>(steps: StepResult<T>[]) {
-  const seen = new Set<string>();
-  for (const call of steps.flatMap((s) => s.toolCalls)) {
-    const key = `${call.toolName}:${JSON.stringify(call.input)}`;
-    if (seen.has(key)) return true;
-    seen.add(key);
-  }
-  return false;
-}
-
-/** One line per tool result from this turn, e.g. `saveJobNote → Saved ...`. */
-function summarizeToolResults<T extends ToolSet>(steps: StepResult<T>[]) {
-  return steps
-    .flatMap((s) => s.toolResults)
-    .map((r) => {
-      const output =
-        typeof r.output === "string" ? r.output : JSON.stringify(r.output);
-      return `- ${r.toolName} → ${output.slice(0, 1500)}`;
-    })
-    .join("\n");
-}
-
-/** The conversation as plain text only: tool calls and tool results removed. */
-function withoutToolParts(messages: ModelMessage[]): ModelMessage[] {
-  return messages.flatMap((m): ModelMessage[] => {
-    if (m.role === "system") return [m];
-    if (m.role === "tool") return [];
-    const text =
-      typeof m.content === "string"
-        ? m.content
-        : m.content
-            .map((p) => (p.type === "text" ? p.text : ""))
-            .join("")
-            .trim();
-    if (!text) return [];
-    return m.role === "user"
-      ? [{ role: "user", content: text }]
-      : [{ role: "assistant", content: text }];
-  });
-}
+export type JobNote = {
+  id: string;
+  company: string;
+  role: string;
+  status: JobStatus;
+  notes: string | null;
+  match_score: number | null;
+  created_at: string;
+};
 
 /**
  * JobSearchCopilot — an AI agent that helps track job applications and
  * compare job descriptions against a saved resume/profile.
  *
+ * One instance (a Durable Object) exists per user: the browser picks a random
+ * ID and connects to /agents/job-search-copilot/<id>, so each user gets their
+ * own isolated SQLite database, chat history, and scheduled reminders.
+ *
  * Components (per the assignment brief):
- *  - LLM: Llama 3.3 on Workers AI
- *  - Workflow / coordination: this Durable Object (Agent) + tool calls,
- *    plus the Agents SDK's built-in task scheduler
- *  - User input: chat, served from a Vite/React frontend on Cloudflare
- *    Pages/Workers assets
- *  - Memory / state: SQLite storage inside the Durable Object (job notes
- *    + resume profile), persisted across sessions and reloads
+ *  - LLM: Llama 3.3 on Workers AI, via AI Gateway
+ *  - Workflow / coordination: this Durable Object runs the chat/tool loop;
+ *    JobAnalysisWorkflow (Cloudflare Workflows) runs durable background
+ *    analysis; the Agents SDK scheduler runs follow-up reminders
+ *  - User input: chat, served from a Vite/React frontend on Workers assets
+ *  - Memory / state: SQLite inside the Durable Object (job notes, match
+ *    analyses, resume profile), persisted across sessions and deploys
  */
 export class JobSearchCopilot extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
@@ -162,8 +71,8 @@ export class JobSearchCopilot extends AIChatAgent<Env> {
   waitForMcpConnections = true;
 
   onStart() {
-    // Create the tables this agent needs, in addition to the built-in
-    // chat history / schedule tables the base Agent class already manages.
+    // Tables for this agent, alongside the chat history / schedule tables the
+    // base Agent class already manages.
     this.sql`
       CREATE TABLE IF NOT EXISTS job_notes (
         id TEXT PRIMARY KEY,
@@ -180,6 +89,15 @@ export class JobSearchCopilot extends AIChatAgent<Env> {
         summary TEXT
       )
     `;
+    // v2: match analysis columns. SQLite has no ADD COLUMN IF NOT EXISTS, so
+    // check the existing columns first (instances created before v2 lack them).
+    const columns = this.sql<{
+      name: string;
+    }>`PRAGMA table_info(job_notes)`.map((c) => c.name);
+    if (!columns.includes("match_score")) {
+      this.sql`ALTER TABLE job_notes ADD COLUMN match_score INTEGER`;
+      this.sql`ALTER TABLE job_notes ADD COLUMN analysis TEXT`;
+    }
 
     this.mcp.configureOAuthCallback({
       customHandler: (result) => {
@@ -197,6 +115,92 @@ export class JobSearchCopilot extends AIChatAgent<Env> {
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // Data access. Used by the chat tools, by JobAnalysisWorkflow over RPC, and
+  // directly by the tests.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Saves a job, or updates it if the same company + role already exists
+   * (case-insensitive), so repeated saves never create duplicates.
+   */
+  saveJob(input: {
+    company: string;
+    role: string;
+    status?: JobStatus;
+    notes?: string;
+  }): { id: string; updated: boolean } {
+    const { company, role, status = "saved", notes } = input;
+    const existing = this.sql<{ id: string }>`
+      SELECT id FROM job_notes
+      WHERE lower(company) = lower(${company}) AND lower(role) = lower(${role})
+    `[0];
+    if (existing) {
+      this.sql`
+        UPDATE job_notes
+        SET status = ${status}, notes = COALESCE(${notes ?? null}, notes)
+        WHERE id = ${existing.id}
+      `;
+      return { id: existing.id, updated: true };
+    }
+    const id = crypto.randomUUID();
+    this.sql`
+      INSERT INTO job_notes (id, company, role, status, notes)
+      VALUES (${id}, ${company}, ${role}, ${status}, ${notes ?? null})
+    `;
+    return { id, updated: false };
+  }
+
+  listJobs(status?: JobStatus): JobNote[] {
+    return status
+      ? this.sql<JobNote>`
+          SELECT id, company, role, status, notes, match_score, created_at
+          FROM job_notes WHERE status = ${status} ORDER BY created_at DESC`
+      : this.sql<JobNote>`
+          SELECT id, company, role, status, notes, match_score, created_at
+          FROM job_notes ORDER BY created_at DESC`;
+  }
+
+  /** Returns the updated job, or null if no job has this id. */
+  setJobStatus(id: string, status: JobStatus): JobNote | null {
+    this.sql`UPDATE job_notes SET status = ${status} WHERE id = ${id}`;
+    return (
+      this.sql<JobNote>`
+        SELECT id, company, role, status, notes, match_score, created_at
+        FROM job_notes WHERE id = ${id}`[0] ?? null
+    );
+  }
+
+  getResumeProfile(): string | null {
+    return (
+      this.sql<{ summary: string }>`
+        SELECT summary FROM resume_profile WHERE id = 1`[0]?.summary ?? null
+    );
+  }
+
+  saveResumeProfile(summary: string) {
+    this.sql`
+      INSERT INTO resume_profile (id, summary) VALUES (1, ${summary})
+      ON CONFLICT(id) DO UPDATE SET summary = excluded.summary
+    `;
+  }
+
+  /** Called by JobAnalysisWorkflow once it has scored a job. */
+  saveJobAnalysis(
+    jobId: string,
+    analysis: { requirements: JobRequirements; match: MatchResult }
+  ) {
+    this.sql`
+      UPDATE job_notes
+      SET match_score = ${analysis.match.score}, analysis = ${JSON.stringify(analysis)}
+      WHERE id = ${jobId}
+    `;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Chat
+  // ---------------------------------------------------------------------------
+
   @callable()
   async addServer(name: string, url: string) {
     return await this.addMcpServer(name, url);
@@ -210,7 +214,10 @@ export class JobSearchCopilot extends AIChatAgent<Env> {
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     const mcpTools = this.mcp.getAITools();
     const workersai = createWorkersAI({
-      binding: fixWorkersAIBinding(this.env.AI)
+      binding: fixWorkersAIBinding(this.env.AI),
+      // Every model call goes through AI Gateway for logging, analytics, and
+      // rate limiting in one place (Cloudflare dashboard → AI → AI Gateway).
+      gateway: { id: this.env.AI_GATEWAY_ID }
     });
 
     const lastUserText =
@@ -220,9 +227,7 @@ export class JobSearchCopilot extends AIChatAgent<Env> {
         ?.parts.map((p) => (p.type === "text" ? p.text : ""))
         .join(" ") ?? "";
 
-    const savedProfile = this.sql<{ summary: string }>`
-      SELECT summary FROM resume_profile WHERE id = 1
-    `[0]?.summary;
+    const savedProfile = this.getResumeProfile();
 
     const modelMessages = pruneMessages({
       messages: await convertToModelMessages(this.messages),
@@ -231,10 +236,7 @@ export class JobSearchCopilot extends AIChatAgent<Env> {
     });
 
     const result = streamText({
-      // Llama 3.3 on Workers AI, as recommended in the assignment brief.
-      model: workersai("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
-        sessionAffinity: this.sessionAffinity
-      }),
+      model: workersai(CHAT_MODEL, { sessionAffinity: this.sessionAffinity }),
       system: `You are Job Search Copilot, an assistant that helps a candidate manage their job search.
 
 You can:
@@ -244,6 +246,8 @@ You can:
 - save or update the user's resume/profile summary (saveResumeProfile) so you can refer back to it later
 - compare a pasted job description against the saved resume profile (compareJobToProfile) and point out
   matching skills and clear gaps — be honest and specific, don't inflate the match
+- run a detailed background analysis of a pasted job posting that saves the job with a match score
+  (analyzeJobPosting) — use this when the user asks to analyze, score, or track a job posting they pasted
 - check the user's timezone and schedule reminders/follow-ups (scheduleTask)
 
 ${savedProfile ? `The user's saved resume/profile summary is:\n${savedProfile}` : "The user has not saved a resume/profile summary yet. If they paste one, offer to save it with saveResumeProfile."}
@@ -262,6 +266,9 @@ answer as: matching keywords/skills, missing/weak areas, and one honest recommen
       tools: {
         ...mcpTools,
 
+        // Save tools return a plain-English confirmation rather than a JSON
+        // flag like { saved: true }: with JSON results Llama 3.3 often
+        // doesn't treat the action as done and calls the tool again.
         saveJobNote: tool({
           description:
             "Save a job posting or application as a note, so it can be recalled later.",
@@ -269,7 +276,7 @@ answer as: matching keywords/skills, missing/weak areas, and one honest recommen
             company: z.string().describe("Company name"),
             role: z.string().describe("Job title / role"),
             status: z
-              .enum(["saved", "applied", "interviewing", "offer", "rejected"])
+              .enum(JOB_STATUSES)
               .optional()
               .describe('Defaults to "saved"'),
             notes: z
@@ -277,45 +284,20 @@ answer as: matching keywords/skills, missing/weak areas, and one honest recommen
               .optional()
               .describe("Any extra notes, e.g. JD summary or link")
           }),
-          // Save tools return a plain-English confirmation rather than a JSON
-          // flag like { saved: true }: with JSON results Llama 3.3 often
-          // doesn't treat the action as done and calls the tool again.
-          execute: async ({ company, role, status = "saved", notes }) => {
-            // Saving the same company + role again updates the existing note
-            // instead of creating a duplicate (Llama sometimes repeats calls).
-            const existing = this.sql<{ id: string }>`
-              SELECT id FROM job_notes
-              WHERE lower(company) = lower(${company}) AND lower(role) = lower(${role})
-            `[0];
-            if (existing) {
-              this.sql`
-                UPDATE job_notes
-                SET status = ${status}, notes = COALESCE(${notes ?? null}, notes)
-                WHERE id = ${existing.id}
-              `;
-              return `Updated the existing note for ${company} – ${role} (status: ${status}, id: ${existing.id}).`;
-            }
-            const id = crypto.randomUUID();
-            this.sql`
-              INSERT INTO job_notes (id, company, role, status, notes)
-              VALUES (${id}, ${company}, ${role}, ${status}, ${notes ?? null})
-            `;
-            return `Saved ${company} – ${role} (status: ${status}, id: ${id}).`;
+          execute: async (input) => {
+            const { id, updated } = this.saveJob(input);
+            const status = input.status ?? "saved";
+            return updated
+              ? `Updated the existing note for ${input.company} – ${input.role} (status: ${status}, id: ${id}).`
+              : `Saved ${input.company} – ${input.role} (status: ${status}, id: ${id}).`;
           }
         }),
 
         listJobNotes: tool({
           description: "List saved job notes, optionally filtered by status.",
-          inputSchema: z.object({
-            status: z
-              .enum(["saved", "applied", "interviewing", "offer", "rejected"])
-              .optional()
-          }),
+          inputSchema: z.object({ status: z.enum(JOB_STATUSES).optional() }),
           execute: async ({ status }) => {
-            const rows = status
-              ? this
-                  .sql`SELECT * FROM job_notes WHERE status = ${status} ORDER BY created_at DESC`
-              : this.sql`SELECT * FROM job_notes ORDER BY created_at DESC`;
+            const rows = this.listJobs(status);
             return rows.length ? rows : "No saved job notes yet.";
           }
         }),
@@ -324,23 +306,13 @@ answer as: matching keywords/skills, missing/weak areas, and one honest recommen
           description: "Update the status of a previously saved job note.",
           inputSchema: z.object({
             id: z.string().describe("The job note ID"),
-            status: z.enum([
-              "saved",
-              "applied",
-              "interviewing",
-              "offer",
-              "rejected"
-            ])
+            status: z.enum(JOB_STATUSES)
           }),
           execute: async ({ id, status }) => {
-            const job = this.sql<{ company: string; role: string }>`
-              SELECT company, role FROM job_notes WHERE id = ${id}
-            `[0];
-            if (!job) {
-              return `No saved job with id ${id}. Use listJobNotes to find the right id.`;
-            }
-            this.sql`UPDATE job_notes SET status = ${status} WHERE id = ${id}`;
-            return `Updated ${job.company} – ${job.role} to "${status}".`;
+            const job = this.setJobStatus(id, status);
+            return job
+              ? `Updated ${job.company} – ${job.role} to "${status}".`
+              : `No saved job with id ${id}. Use listJobNotes to find the right id.`;
           }
         }),
 
@@ -360,10 +332,7 @@ answer as: matching keywords/skills, missing/weak areas, and one honest recommen
             if (wordOverlap(summary, lastUserText) < 0.5) {
               return "Not saved: this doesn't look like the user's own resume text. Ask the user to paste their resume or a summary of their experience.";
             }
-            this.sql`
-              INSERT INTO resume_profile (id, summary) VALUES (1, ${summary})
-              ON CONFLICT(id) DO UPDATE SET summary = excluded.summary
-            `;
+            this.saveResumeProfile(summary);
             return "Resume profile saved.";
           }
         }),
@@ -375,9 +344,7 @@ answer as: matching keywords/skills, missing/weak areas, and one honest recommen
             jobDescription: z.string().describe("The job description text")
           }),
           execute: async ({ jobDescription }) => {
-            const profile = this.sql<{ summary: string }>`
-              SELECT summary FROM resume_profile WHERE id = 1
-            `[0]?.summary;
+            const profile = this.getResumeProfile();
             if (!profile) {
               return "No resume/profile summary saved yet. Do not call saveResumeProfile now — ask the user to paste their resume first.";
             }
@@ -388,6 +355,33 @@ answer as: matching keywords/skills, missing/weak areas, and one honest recommen
             // actual comparison/reasoning in its response, this tool just
             // makes sure both pieces of context are present together.
             return { profile, jobDescription };
+          }
+        }),
+
+        analyzeJobPosting: tool({
+          description:
+            "Save a pasted job posting and start a detailed background analysis that extracts its requirements and scores it against the saved resume. The result appears in the chat when ready.",
+          inputSchema: z.object({
+            company: z.string().describe("Company name"),
+            role: z.string().describe("Job title / role"),
+            jobDescription: z
+              .string()
+              .describe("The full job description text, as pasted")
+          }),
+          execute: async ({ company, role, jobDescription }) => {
+            if (!this.getResumeProfile()) {
+              return "No resume saved yet, so there is nothing to score against. Ask the user to paste their resume first.";
+            }
+            if (jobDescription.trim().length < 150) {
+              return "The job description is too short to analyze. Ask the user to paste the full job posting text.";
+            }
+            const { id: jobId } = this.saveJob({ company, role });
+            await this.runWorkflow<JobAnalysisParams>(
+              "JOB_ANALYSIS_WORKFLOW",
+              { jobId, company, role, jobDescription },
+              { metadata: { jobId } }
+            );
+            return `Saved ${company} – ${role} and started a background analysis. The match score will appear here in a few seconds.`;
           }
         }),
 
@@ -477,8 +471,18 @@ answer as: matching keywords/skills, missing/weak areas, and one honest recommen
       abortSignal: options?.abortSignal
     });
 
-    return result.toUIMessageStreamResponse();
+    return result.toUIMessageStreamResponse({
+      onError: (error) => {
+        console.error("Chat stream error:", error);
+        return friendlyAIError(error);
+      }
+    });
   }
+
+  // ---------------------------------------------------------------------------
+  // Background work: scheduled reminders and JobAnalysisWorkflow callbacks.
+  // Results are pushed to connected browsers over the agent's WebSocket.
+  // ---------------------------------------------------------------------------
 
   async executeTask(description: string, _task: Schedule<string>) {
     console.log(`Executing scheduled task: ${description}`);
@@ -487,6 +491,45 @@ answer as: matching keywords/skills, missing/weak areas, and one honest recommen
         type: "scheduled-task",
         description,
         timestamp: new Date().toISOString()
+      })
+    );
+  }
+
+  async onWorkflowProgress(
+    _workflowName: string,
+    workflowId: string,
+    progress: unknown
+  ) {
+    this.broadcast(
+      JSON.stringify({ type: "job-analysis-progress", workflowId, progress })
+    );
+  }
+
+  async onWorkflowComplete(
+    _workflowName: string,
+    workflowId: string,
+    result?: unknown
+  ) {
+    const analysis = result as JobAnalysisResult;
+    this.broadcast(
+      JSON.stringify({ type: "job-analysis-complete", workflowId, ...analysis })
+    );
+  }
+
+  async onWorkflowError(
+    _workflowName: string,
+    workflowId: string,
+    error: string
+  ) {
+    console.error(`Job analysis ${workflowId} failed:`, error);
+    this.broadcast(
+      JSON.stringify({
+        type: "job-analysis-error",
+        workflowId,
+        // Our own errors (e.g. "No resume saved…") are already user-facing.
+        error: error.startsWith("No resume saved")
+          ? error
+          : friendlyAIError(error)
       })
     );
   }

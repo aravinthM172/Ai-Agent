@@ -1,80 +1,138 @@
 # Job Search Copilot
 
+[![Sanity Check](https://github.com/aravinthM172/Ai-Agent/actions/workflows/sanity-check.yml/badge.svg)](https://github.com/aravinthM172/Ai-Agent/actions/workflows/sanity-check.yml)
+
 **Live demo:** https://job-search-copilot.aravinthm172.workers.dev
 
-An AI agent, built on Cloudflare, that helps track job applications and check a job description against your resume/profile.
+An AI agent on Cloudflare that tracks your job applications and tells you honestly how well you match a job. You chat with it in plain English:
 
-Built for the Cloudflare Agents assignment (see [agents.cloudflare.com](https://agents.cloudflare.com/) and the [Agents SDK docs](https://developers.cloudflare.com/agents/)). It uses the four required components:
+- "Save my resume: backend engineer, 4 years, TypeScript, Node.js, PostgreSQL, AWS…"
+- "Analyze this posting: _(paste a job description)_" → background analysis → **"Acme – Senior Backend Engineer: 65% match. Missing: Kubernetes."**
+- "Save this job: Acme Corp, Backend Engineer, I just applied"
+- "What jobs have I applied to?" / "I got an interview with Acme"
+- "Remind me to follow up with Acme in 3 days"
 
-| Component | What it uses |
-|---|---|
-| LLM | **Llama 3.3** on Workers AI (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`) |
-| Workflow / coordination | A **Durable Object** (`JobSearchCopilot`, via the Agents SDK) running the tool-call loop, plus the SDK's built-in task scheduler for follow-up reminders |
-| User input | **Chat**, served from a React/Vite frontend on Cloudflare Workers assets (Pages-style static hosting) |
-| Memory / state | **SQLite storage inside the Durable Object** — saved job notes and the resume/profile summary persist across sessions and page reloads |
+Built for the Cloudflare AI application assignment on the [Agents SDK](https://developers.cloudflare.com/agents/).
 
-## What it does
+## Assignment components
 
-- **Save a job application as a note** — company, role, status, and any notes ("save this: Acme Corp, Backend Engineer, applied today")
-- **List saved jobs**, optionally filtered by status (saved / applied / interviewing / offer / rejected)
-- **Update a job's status** as you move through the process
-- **Save your resume/profile summary** once, so the agent can refer back to it
-- **Compare a pasted job description against your saved profile** — matching skills, gaps, and one honest recommendation (no inflated claims)
-- **Schedule follow-up reminders** ("remind me to follow up with Acme in 3 days")
+| Component                   | Implementation                                                                                                                                                                                                                      |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **LLM**                     | Llama 3.3 70B on **Workers AI** (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`), routed through **AI Gateway**                                                                                                                         |
+| **Workflow / coordination** | A **Durable Object** per user (`JobSearchCopilot`, Agents SDK) runs the chat and tool-calling loop; a **Cloudflare Workflow** (`JobAnalysisWorkflow`) runs durable multi-step job analysis; the Agents SDK scheduler runs reminders |
+| **User input**              | **Chat** over WebSockets, from a React UI served by **Workers static assets**                                                                                                                                                       |
+| **Memory / state**          | **SQLite inside each Durable Object**: jobs, match analyses, resume profile, chat history, and schedules, persisted across sessions and deploys                                                                                     |
 
-All of this is backed by real tool calls the model makes during the conversation (see `src/server.ts`), not just prompting — the model decides when to call `saveJobNote`, `compareJobToProfile`, etc., and the Durable Object executes them against its own SQLite storage.
+## Architecture
+
+```mermaid
+flowchart LR
+  B["Browser<br/>React chat UI<br/>(random session ID in localStorage)"]
+  W["Worker<br/>routeAgentRequest()"]
+  subgraph DO["Durable Object: JobSearchCopilot (one per user)"]
+    direction TB
+    L["Chat + tool loop<br/>(AI SDK streamText)"]
+    S[("SQLite<br/>job_notes · resume_profile<br/>chat history · schedules")]
+    L --- S
+  end
+  WF["Workflow: JobAnalysisWorkflow<br/>1 extract-requirements<br/>2 load-profile<br/>3 save-analysis"]
+  G["AI Gateway<br/>logs · analytics · cache"]
+  AI["Workers AI<br/>Llama 3.3 70B"]
+
+  B <-- "WebSocket /agents/job-search-copilot/:sessionId" --> W --> DO
+  L -- "analyzeJobPosting → runWorkflow()" --> WF
+  WF -- "RPC: getResumeProfile / saveJobAnalysis" --> DO
+  WF -- "progress / complete events" --> DO -- "broadcast → toast" --> B
+  L --> G
+  WF --> G
+  G --> AI
+```
+
+**Request flow for "analyze this job posting":**
+
+1. The browser sends the message over the agent's WebSocket. The Worker routes it to the user's own Durable Object by session ID.
+2. The chat loop streams Llama 3.3's response. The model calls the `analyzeJobPosting` tool, which saves the job to SQLite and starts `JobAnalysisWorkflow`. The chat replies right away.
+3. The Workflow runs in the background:
+   - **extract-requirements:** Llama 3.3 in JSON mode returns the required and nice-to-have skills, minimum years of experience and seniority, validated with zod. Retried with exponential backoff, and cached by AI Gateway.
+   - **load-profile:** reads the resume from the agent's SQLite over RPC.
+   - **save-analysis:** computes a deterministic match score in code and writes it back.
+4. The Workflow reports progress and completion to the agent, which broadcasts it to the browser as a toast: _"Acme – Senior Backend Engineer: 65% match. Missing: Kubernetes."_
+
+## Design decisions
+
+- **One Durable Object per user.** Each browser generates a random session ID and connects to its own agent instance, so every user gets an isolated, strongly consistent SQLite database with no shared tables or `WHERE user_id = ?` filters. It also scales horizontally, because each user's agent runs on its own. (The template's default connected everyone to one shared `default` instance; a test in `test/agent.test.ts` asserts isolation.)
+- **A Workflow for analysis, not a longer chat turn.** The LLM extraction can fail transiently (rate limits, timeouts, malformed JSON). As a Workflow step it is retried with backoff, completed steps are never re-run, and the run survives restarts and deploys. The chat stays responsive, with results pushed to the browser when they're ready.
+- **The LLM extracts; code scores.** Asking the model for a "match percentage" gives a different number every run. Here the model only extracts requirements (structured JSON, validated), and `src/lib/matching.ts` computes the score deterministically, handling aliases (`k8s` → Kubernetes), alternatives ("Go _or_ TypeScript") and negation ("_no_ Kubernetes experience" doesn't count as having it). Same input, same score, and fully unit-tested.
+- **AI Gateway in front of Workers AI.** Every model call is logged and visible in one dashboard, and the extraction step is cached for 24h: re-analyzing the same posting costs no inference. Configured with one `gateway` option, so switching models or providers later doesn't touch the agent.
+- **Friendly failures.** Workers AI errors (daily limit, rate limit, timeout) are mapped to plain-English messages in the chat instead of the SDK's generic "An error occurred.", and raw errors are never shown to the user.
+
+## Reliability work: bugs found in production and how they were fixed
+
+Testing the deployed agent surfaced real issues. Each fix is documented in code comments and covered by tests.
+
+| Problem observed                                                                               | Root cause                                                                                                                                                               | Fix                                                                                                                                                                           |
+| ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Every tool call failed; tool arguments looked like `{"summary": "{"summary": "BackendBackend…` | Workers AI's Llama 3.3 stream now sends each delta **twice** per SSE chunk (`choices[0].delta` and legacy `response`/`tool_calls`); `workers-ai-provider` 3.x reads both | `fixWorkersAIBinding` wraps the AI binding and strips the legacy fields from the SSE stream (`src/lib/workers-ai.ts`)                                                         |
+| The agent looped, calling tools 20× per message, and saved invented text as the user's resume  | Llama 3.3 repeats tool calls when tool results are JSON flags, and fills gaps with placeholder text                                                                      | Plain-English tool results; upsert instead of insert; grounding check on resume text; missing-input checks; after a repeated call a tool-free final step forces a text answer |
+| Replies came back empty after the loop guard kicked in                                         | The provider sends `tools: []` for tool-less steps, which Workers AI rejects                                                                                             | The binding wrapper omits empty `tools`/`tool_choice`                                                                                                                         |
+| Long answers cut off mid-sentence                                                              | Provider default of 256 output tokens                                                                                                                                    | `maxOutputTokens: 1024`                                                                                                                                                       |
+| "An error occurred." with no explanation                                                       | Workers AI free tier daily limit (error 4006) hidden by the SDK                                                                                                          | `friendlyAIError` + an error banner in the UI                                                                                                                                 |
+
+## Testing
+
+```bash
+npm test         # 36 tests, run inside the real Workers runtime (workerd)
+npm run check    # formatting (oxfmt), lint (oxlint), types (tsc)
+```
+
+Tests use [`@cloudflare/vitest-pool-workers`](https://developers.cloudflare.com/workers/testing/vitest-integration/), so they run against real Durable Objects, SQLite, and the Workflows engine, not mocks of them:
+
+- `test/agent.test.ts`: Durable Object storage (upserts, status updates, per-user isolation) and an **end-to-end Workflow run** with the LLM step mocked via `introspectWorkflowInstance` (extract → RPC → score → saved to SQLite).
+- `test/matching.test.ts`: the scoring engine (aliases, negation, whole-word matching, `C++`/`C#`, experience penalty, determinism).
+- `test/workers-ai.test.ts`: the SSE de-duplication (including chunks split mid-line), empty-tools handling, and error mapping.
+- `test/guardrails.test.ts`: loop detection, made-up-resume detection (using the real strings Llama produced), and JSON-mode parsing.
+
+No test calls Workers AI, so the suite is fast, free, and deterministic. CI (GitHub Actions) runs `check` and `test` on every push.
 
 ## Project structure
 
 ```
 src/
-  server.ts   # Durable Object agent: Workers AI model, tools, SQLite tables
-  app.tsx     # React chat UI
-  client.tsx  # Vite entry point
-  styles.css
-public/       # static assets served by Workers assets (Pages-style)
-wrangler.jsonc
+  server.ts                  # JobSearchCopilot agent (Durable Object): SQLite schema, data access, chat tools, workflow callbacks
+  workflows/job-analysis.ts  # JobAnalysisWorkflow: durable 3-step analysis
+  lib/
+    workers-ai.ts            # AI binding fixes, friendly error messages
+    requirements.ts          # LLM requirement extraction (JSON mode + zod)
+    matching.ts              # deterministic resume ↔ job scoring
+    guardrails.ts            # loop / made-up-data guards for tool use
+  app.tsx                    # React chat UI (per-browser session, toasts, error banner)
+test/                        # Vitest suites (Workers runtime)
+wrangler.jsonc               # bindings: Durable Object, Workflow, Workers AI, assets, AI Gateway id
 ```
 
-## Running it
+## Running locally
 
 ```bash
 npm install
-npm run dev
+npx wrangler login   # Workers AI has no local simulator; dev proxies AI calls to your account
+npm run dev          # http://localhost:5173
 ```
 
-**Cloudflare authentication is required to run locally.** This project uses Workers AI with `"ai": { "remote": true }` in `wrangler.jsonc`, and Workers AI has no local simulator — so `npm run dev` opens a remote proxy session against Cloudflare and needs you to be logged in. Either run `wrangler login` once in an interactive terminal, or set a `CLOUDFLARE_API_TOKEN` environment variable in your shell or a `.env` file (see `.dev.vars.example` for the variable name). Your account also needs a `workers.dev` subdomain registered (Workers & Pages → onboarding in the dashboard); remote dev mode fails with error 10063 without one. No third-party (OpenAI/Anthropic) API key is needed — Workers AI is billed to your Cloudflare account and has a free tier.
-
-Open [http://localhost:5173](http://localhost:5173).
-
-Try:
-- **"Save my resume: <paste a short summary>"** → saves the profile via `saveResumeProfile`
-- **Paste a job description and ask "how do I match up?"** → `compareJobToProfile`
-- **"Save this job: Acme Corp, Backend Engineer, I just applied"** → `saveJobNote`
-- **"What jobs have I applied to?"** → `listJobNotes`
-- **"Remind me to follow up on the Acme application in 3 days"** → scheduling
+Your Cloudflare account needs a `workers.dev` subdomain (Workers & Pages → onboarding in the dashboard), or remote dev mode fails with error 10063. Instead of `wrangler login`, you can set `CLOUDFLARE_API_TOKEN` in a `.env` file (see `.dev.vars.example`). No third-party API key is needed.
 
 ## Deploying
 
 ```bash
-npm run deploy
+npm run deploy       # vite build && wrangler deploy
 ```
 
-This runs `vite build && wrangler deploy`, which needs a Cloudflare account with Workers enabled (`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, or an interactive `wrangler login`).
+## Limitations and next steps
 
-## Workarounds for Llama 3.3 / Workers AI quirks
-
-`src/server.ts` contains a few deliberate workarounds, found while testing the deployed agent:
-
-- **Duplicated stream deltas.** Workers AI streams for Llama 3.3 now include each delta twice per SSE chunk (in `choices[0].delta` and in the legacy top-level `response` / `tool_calls` fields). `workers-ai-provider` 3.x reads both, corrupting tool-call arguments so every tool call fails. `fixWorkersAIBinding` strips the legacy fields. It also drops the empty `tools: []` array the provider sends for tool-less steps, which Workers AI rejects. Both can go once the project moves to a provider version that handles this (4.x requires `ai` v7).
-- **Repeated tool calls.** Llama 3.3 tends to call tools again and again, and even invented placeholder data (e.g. saved "Please share your resume…" as the resume). Mitigations:
-  - Save tools return plain-English confirmations instead of JSON flags.
-  - `saveJobNote` updates an existing company + role instead of duplicating it.
-  - `saveResumeProfile` refuses text that isn't grounded in the user's message.
-  - `compareJobToProfile` refuses a missing or too-short job description.
-  - After a repeated call or 3 tool rounds, a final tool-free step makes the model answer in plain text.
-- **Output length.** The provider defaults to 256 output tokens, which truncated comparisons; `maxOutputTokens` is set to 1024.
+- **Identity is a bearer session ID.** Anyone with a browser's session ID could open that agent. It's unguessable (UUID v4), but real accounts would put [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/) or OAuth in front and derive the agent name from the authenticated user.
+- **Free-tier limits.** The Workers AI free tier allows 10,000 neurons per day, and Llama 3.3 70B uses them quickly. AI Gateway caching helps; production would use Workers Paid and AI Gateway rate limits per user.
+- **Model reliability.** Llama 3.3's tool calling needed the guardrails above. The provider layer is swappable (the AI SDK plus AI Gateway), so a stronger tool-calling model could be dropped in.
+- **Ideas:** fetch job postings from a URL with Browser Rendering, semantic skill matching with Vectorize embeddings instead of aliases, human-in-the-loop approval before saves (the UI already supports tool approvals), and an email agent that ingests job alerts.
 
 ## AI-assisted development
 
-This project was scaffolded from Cloudflare's official `cloudflare/agents-starter` template and then customized (system prompt, tools, SQLite schema, branding) with AI assistance (Claude). See [`PROMPT_HISTORY.md`](./PROMPT_HISTORY.md) for the prompt history, as requested in the assignment.
+This project was built with AI assistance (Claude), starting from Cloudflare's official `cloudflare/agents-starter` template. The complete prompt history, including the debugging sessions above, is in [`PROMPTS.md`](./PROMPTS.md).

@@ -69,6 +69,29 @@ function fileToDataUri(file: File): Promise<string> {
 
 // ── Small components ──────────────────────────────────────────────────
 
+const SESSION_KEY = "job-search-copilot:session-id";
+
+/**
+ * Each browser gets its own agent instance (its own Durable Object, with its
+ * own SQLite data), identified by a random ID kept in localStorage. Without
+ * this, every visitor would share one "default" agent and see each other's
+ * jobs and resume.
+ */
+function getSessionId(): string {
+  try {
+    let id = localStorage.getItem(SESSION_KEY);
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem(SESSION_KEY, id);
+    }
+    return id;
+  } catch {
+    // Storage blocked (e.g. some private modes): still private, just not
+    // remembered across reloads.
+    return crypto.randomUUID();
+  }
+}
+
 function ThemeToggle() {
   const [dark, setDark] = useState(
     () => document.documentElement.getAttribute("data-mode") === "dark"
@@ -281,8 +304,11 @@ function Chat() {
   const [isAddingServer, setIsAddingServer] = useState(false);
   const mcpPanelRef = useRef<HTMLDivElement>(null);
 
+  const [sessionId] = useState(getSessionId);
+
   const agent = useAgent<JobSearchCopilot>({
     agent: "job-search-copilot",
+    name: sessionId,
     onOpen: useCallback(() => setConnected(true), []),
     onClose: useCallback(() => setConnected(false), []),
     onError: useCallback(
@@ -300,6 +326,21 @@ function Chat() {
             toasts.add({
               title: "Scheduled task completed",
               description: data.description,
+              timeout: 0
+            });
+          } else if (data.type === "job-analysis-complete") {
+            const missing = data.missingSkills?.length
+              ? ` Missing: ${data.missingSkills.join(", ")}.`
+              : "";
+            toasts.add({
+              title: `${data.company} – ${data.role}: ${data.score}% match`,
+              description: `Matched: ${data.matchedSkills?.join(", ") || "none"}.${missing}`,
+              timeout: 0
+            });
+          } else if (data.type === "job-analysis-error") {
+            toasts.add({
+              title: "Job analysis failed",
+              description: data.error,
               timeout: 0
             });
           }
@@ -357,7 +398,8 @@ function Chat() {
     clearHistory,
     addToolApprovalResponse,
     stop,
-    status
+    status,
+    error
   } = useAgentChat({
     agent,
     experimental_throttle: 100,
@@ -867,6 +909,15 @@ function Chat() {
               e.target.value = "";
             }}
           />
+
+          {error && !isStreaming && (
+            <div
+              role="alert"
+              className="mb-2 rounded-lg border border-kumo-danger bg-kumo-danger-tint px-3 py-2 text-sm text-kumo-default"
+            >
+              {error.message}
+            </div>
+          )}
 
           {attachments.length > 0 && (
             <div className="flex gap-2 mb-2 flex-wrap">

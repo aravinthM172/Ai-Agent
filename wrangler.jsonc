@@ -5,6 +5,11 @@
   "compatibility_date": "2026-06-11",
   "compatibility_flags": ["nodejs_compat"],
   "ai": { "binding": "AI", "remote": true },
+  "vars": {
+    // AI Gateway that all Workers AI calls are routed through. "default" is
+    // created automatically by Cloudflare on first use.
+    "AI_GATEWAY_ID": "default"
+  },
   "assets": {
     "directory": "./public",
     "not_found_handling": "single-page-application",
@@ -18,10 +23,18 @@
       }
     ]
   },
+  "workflows": [
+    {
+      "name": "job-analysis-workflow",
+      "binding": "JOB_ANALYSIS_WORKFLOW",
+      "class_name": "JobAnalysisWorkflow"
+    }
+  ],
   "migrations": [
     {
       "new_sqlite_classes": ["JobSearchCopilot"],
       "tag": "v1"
     }
-  ]
+  ],
+  "observability": { "enabled": true }
 }

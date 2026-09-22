@@ -8,6 +8,7 @@ omitted).
 ---
 
 **User:**
+
 > We plan to fast track candidates who complete an assignment to build a
 > type of AI-powered application (https://agents.cloudflare.com/) on
 > Cloudflare. An AI-powered application should include the following
@@ -36,10 +37,12 @@ creating a Cloudflare account, enabling Workers, and generating an API
 token + Account ID.
 
 **User:**
+
 > Optional Assignment: Please share GitHub repo URL for the project here
 > [repeated the same assignment brief]
 
 **Claude:** Proceeded to build the project:
+
 1. Cloned `cloudflare/agents-starter` (the official Cloudflare template).
 2. Renamed the agent class from `ChatAgent` to `JobSearchCopilot` and
    updated `wrangler.jsonc`, `package.json`, and the client's `useAgent`
@@ -80,12 +83,14 @@ session (Claude Opus 5.5), from the project folder unzipped from
 `job-search-copilot.zip`.
 
 **User:**
+
 > I have a Cloudflare Agents project in the current folder (unzipped from job-search-copilot.zip)
 > called Job Search Copilot — an AI agent built on the cloudflare/agents-starter template using
 > Llama 3.3 on Workers AI, a Durable Object for coordination, SQLite-backed memory for job notes
 > and a resume profile, and a React chat UI.
 >
 > Please:
+>
 > 1. Initialize git, commit everything, and push it to https://github.com/aravinthM172/Ai-Agent
 >    on the main branch. I have a GitHub personal access token I'll provide when you ask for
 >    credentials — use it for HTTPS auth, don't ask me to paste it into a file.
@@ -105,6 +110,7 @@ session (Claude Opus 5.5), from the project folder unzipped from
 register it" for the missing `workers.dev` subdomain.
 
 **Claude Code:**
+
 1. Initialized git and pushed to `main` (the GitHub repo was still empty at
    this point, so this was the first push of the code). `npm install`, `tsc`,
    and `oxlint` all passed.
@@ -133,15 +139,18 @@ register it" for the missing `workers.dev` subdomain.
    `.dev.vars`).
 
 **User (follow-up):**
+
 > i typed once it sending sam msg again again
 
 **Claude Code:** Read the live chat history and found the agent looping. The user had sent a message without a real job posting or resume. Llama then alternated between `compareJobToProfile` and `saveResumeProfile` until the 20-step limit, and saved an invented placeholder as the resume. Testing the model outside the Durable Object showed:
+
 - Llama repeats a tool much less often when the tool returns a plain-English confirmation instead of JSON like `{ saved: true }`.
 - Removing tools (`activeTools`) or forcing `toolChoice: "none"` doesn't stop Llama. With tool calls still in the history, it either keeps calling the tools or prints the calls as JSON.
 - `workers-ai-provider` sends `tools: []` for tool-less steps, which Workers AI rejects.
 - The provider defaults to `max_tokens: 256`.
 
 Fixes, deployed and re-tested live with the same message:
+
 - Save tools return plain-text results.
 - `saveJobNote` upserts instead of duplicating.
 - The resume and job-description tools refuse input that is missing or invented.
@@ -149,6 +158,7 @@ Fixes, deployed and re-tested live with the same message:
 - The binding wrapper omits empty `tools` arrays, and `maxOutputTokens` is set to 1024.
 
 **User (other questions in the same session):**
+
 > what is use of this what we can do
 
 > did u pusged
@@ -160,6 +170,7 @@ the GitHub push (local `main` matched `origin/main`), and gave a step-by-step
 list of messages to try.
 
 **User:**
+
 > inspect browser no ouptup
 
 **Claude Code:** Reproduced it against the live site ("An error occurred.") and
@@ -170,6 +181,7 @@ listed: wait for the reset, upgrade to Workers Paid, or switch to a smaller
 model.
 
 **User:**
+
 > https://developers.cloudflare.com/agents/?utm_content=agents.cloudflare.com
 
 **Claude Code:** Read the Agents docs page and mapped this project to it:
@@ -178,9 +190,58 @@ Workers AI. Also suggested possible additions (human-in-the-loop approval,
 browser tool, email or voice input, other model providers).
 
 **User:**
+
 > Optional Assignment: Please share GitHub repo URL for the project here
 
 > Note: AI-assisted coding is encouraged, but you have to submit prompt history.
 
 **Claude Code:** Shared the repo URL and a short submission description, and
 updated this file to quote the user's Claude Code prompts word for word.
+
+**User:**
+
+> see this is for sde role in cloudflare they gave this project it shjuld be imprisve and should shows i have knowlege make sure i select in this role
+
+**Claude Code:** Explained honestly that no project can guarantee selection, then
+proposed upgrades. It also found that CI had been failing on GitHub because of
+formatting. Asked which upgrades to make.
+
+**User:**
+
+> all is possible? we do all it improve my score
+
+**Claude Code:** Implemented all of them, testing everything that didn't need
+the (exhausted) AI quota:
+
+1. **Per-user Durable Objects.** The browser generates a random session ID
+   (localStorage) and connects to its own agent instance, so each user has an
+   isolated SQLite database. Before this, every visitor shared `default`.
+2. **Cloudflare Workflow (`JobAnalysisWorkflow`).** A new `analyzeJobPosting`
+   tool starts a durable 3-step workflow:
+   - Llama 3.3 JSON-mode requirement extraction, validated with zod and
+     retried with backoff
+   - load the resume over RPC
+   - a deterministic match score in code, saved back to SQLite
+     Progress and completion are pushed to the browser as toasts. It uses the
+     Agents SDK's `AgentWorkflow` / `runWorkflow` integration.
+3. **Deterministic matching engine (`src/lib/matching.ts`).** Handles aliases,
+   "X or Y" alternatives, negation ("No Kubernetes experience"), whole-word
+   matching, and an experience-gap penalty.
+4. **AI Gateway.** All model calls are routed through the account's `default`
+   gateway; the extraction step is cached for 24h. The OAuth login couldn't
+   create a named gateway, so probing showed that a nonexistent gateway fails
+   with error 2001 while `default` reaches the model.
+5. **Friendly errors.** Workers AI errors (daily limit 4006, rate limits,
+   timeouts) become plain-English messages, shown in a new error banner.
+   Verified in the browser against the real 4006 error.
+6. **Refactor.** `server.ts` was split into `src/lib/*` and `src/workflows/*`.
+   Data access moved to agent methods, shared by the chat tools, the Workflow
+   (over RPC), and the tests. Added a v2 SQLite migration (`match_score`,
+   `analysis`).
+7. **Tests.** 36 Vitest tests run in the Workers runtime
+   (`@cloudflare/vitest-pool-workers`), including an end-to-end Workflow run
+   with the LLM step mocked via `introspectWorkflowInstance`, and a per-user
+   isolation test. CI now runs `check` and `test` on Node 22.
+8. **Docs.** Rewrote the README as a design doc (architecture diagram, design
+   decisions, bugs found and fixed, testing, limitations). Renamed this file
+   from `PROMPT_HISTORY.md` to `PROMPTS.md`.

@@ -2,7 +2,7 @@
   "name": "job-search-copilot",
   "version": "1.0.0",
   "private": true,
-  "description": "Starter template for building AI chat agents on Cloudflare",
+  "description": "AI job-search agent on Cloudflare: Agents SDK, Durable Objects, Workflows, Workers AI (Llama 3.3), AI Gateway",
   "keywords": [
     "agents",
     "ai",
@@ -15,6 +15,7 @@
     "start": "vite dev",
     "deploy": "vite build && wrangler deploy",
     "types": "wrangler types env.d.ts",
+    "test": "vitest run",
     "format": "oxfmt --write .",
     "lint": "oxlint src/",
     "check": "oxfmt --check . && oxlint src/ && tsc"
@@ -35,6 +36,7 @@
   "devDependencies": {
     "@babel/plugin-proposal-decorators": "^8.0.2",
     "@cloudflare/vite-plugin": "^1.46.0",
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
     "@rolldown/plugin-babel": "^0.2.3",
     "@tailwindcss/vite": "^4.3.1",
     "@types/node": "^26.0.1",
@@ -46,6 +48,7 @@
     "tailwindcss": "^4.3.1",
     "typescript": "^6.0.3",
     "vite": "^8.1.0",
+    "vitest": "^4.1.11",
     "wrangler": "^4.113.0"
   },
   "allowScripts": {
