@@ -1,4 +1,6 @@
-# Copy this file to .dev.vars and fill in your own value.
+# Copy this file to .env (not .dev.vars) and fill in your own value, or run
+# `npx wrangler login` instead. Wrangler reads CLOUDFLARE_API_TOKEN from .env
+# for its own authentication; .dev.vars only sets runtime vars for the Worker.
 # Needed for `npm run dev` (Workers AI has no local simulator, so dev mode
 # proxies to your real Cloudflare account) and for `npm run deploy`.
 CLOUDFLARE_API_TOKEN=your-api-token-here

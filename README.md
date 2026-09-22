@@ -1,5 +1,7 @@
 # Job Search Copilot
 
+**Live demo:** https://job-search-copilot.aravinthm172.workers.dev
+
 An AI agent, built on Cloudflare, that helps track job applications and check a job description against your resume/profile.
 
 Built for the Cloudflare Agents assignment (see [agents.cloudflare.com](https://agents.cloudflare.com/) and the [Agents SDK docs](https://developers.cloudflare.com/agents/)). It uses the four required components:
@@ -41,7 +43,7 @@ npm install
 npm run dev
 ```
 
-**Cloudflare authentication is required to run locally.** This project uses Workers AI with `"ai": { "remote": true }` in `wrangler.jsonc`, and Workers AI has no local simulator — so `npm run dev` opens a remote proxy session against Cloudflare and needs you to be logged in. Either run `wrangler login` once in an interactive terminal, or set a `CLOUDFLARE_API_TOKEN` environment variable (e.g. in a `.env` file, see `.dev.vars.example`). No third-party (OpenAI/Anthropic) API key is needed — Workers AI is billed to your Cloudflare account and has a free tier.
+**Cloudflare authentication is required to run locally.** This project uses Workers AI with `"ai": { "remote": true }` in `wrangler.jsonc`, and Workers AI has no local simulator — so `npm run dev` opens a remote proxy session against Cloudflare and needs you to be logged in. Either run `wrangler login` once in an interactive terminal, or set a `CLOUDFLARE_API_TOKEN` environment variable in your shell or a `.env` file (see `.dev.vars.example` for the variable name). Your account also needs a `workers.dev` subdomain registered (Workers & Pages → onboarding in the dashboard); remote dev mode fails with error 10063 without one. No third-party (OpenAI/Anthropic) API key is needed — Workers AI is billed to your Cloudflare account and has a free tier.
 
 Open [http://localhost:5173](http://localhost:5173).
 
@@ -58,7 +60,11 @@ Try:
 npm run deploy
 ```
 
-This runs `wrangler deploy`, which needs a Cloudflare account with Workers enabled (`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, or an interactive `wrangler login`).
+This runs `vite build && wrangler deploy`, which needs a Cloudflare account with Workers enabled (`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, or an interactive `wrangler login`).
+
+## Known issue: duplicated Workers AI stream deltas
+
+Workers AI's streaming responses for Llama 3.3 currently include each delta twice per SSE chunk — in OpenAI-style `choices[0].delta` and in the legacy top-level `response` / `tool_calls` fields. `workers-ai-provider` 3.x reads both, which corrupts streamed tool-call arguments so every tool call fails validation. `src/server.ts` wraps the `AI` binding (`dedupeStreamChunks`) to strip the legacy fields before the provider sees them. This can be removed once the project moves to a provider version that handles the new format (4.x requires `ai` v7).
 
 ## AI-assisted development
 

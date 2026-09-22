@@ -70,3 +70,45 @@ token + Account ID.
 No other AI tool was used for this build — all code was written by Claude
 inside the session, reviewed and adjusted by re-running the type checker,
 linter, and build after each change described above.
+
+---
+
+## Deployment via Claude Code (2026-09-22)
+
+The project was then pushed, tested, and deployed from a separate Claude Code
+session (Claude Opus 5.5), from the project folder unzipped from
+`job-search-copilot.zip`.
+
+**User (condensed):** Initialize git and push to
+`github.com/aravinthM172/Ai-Agent` on `main`; run `npm install`; log into
+Cloudflare and confirm `npm run dev` works by testing `saveResumeProfile`,
+`compareJobToProfile`, and `saveJobNote`; deploy with `npm run deploy`;
+check README/PROMPT_HISTORY accuracy and note this step here.
+
+**Claude Code:**
+1. Initialized git and pushed to `main` (the GitHub repo was still empty at
+   this point, so this was the first push of the code). `npm install`, `tsc`,
+   and `oxlint` all passed.
+2. Logged into Cloudflare with `wrangler login`. `npm run dev` initially
+   failed with error 10063 because the account had no `workers.dev`
+   subdomain, so one (`aravinthm172`) was registered through the Cloudflare API.
+3. Testing in the chat UI showed **every tool call failing** and the model
+   retrying in a loop. Root cause: Workers AI's Llama 3.3 stream now sends
+   each delta both in `choices[0].delta` and in legacy top-level
+   `response`/`tool_calls` fields, and `workers-ai-provider` 3.x consumes
+   both, producing corrupted arguments like
+   `{"summary": "{"summary": "BackendBackend ...`. Reproduced it outside the
+   Durable Object with `getPlatformProxy` (3.2.1 and 3.3.1 both affected;
+   4.0.0 requires `ai` v7). Fixed by wrapping the `AI` binding
+   (`dedupeStreamChunks` in `src/server.ts`) to strip the duplicate legacy
+   fields.
+4. Replaced the starter's leftover suggested prompts (weather, calculator)
+   with job-search prompts that match the real tools.
+5. Re-tested locally: `saveResumeProfile`, `compareJobToProfile`,
+   `saveJobNote`, and `listJobNotes` all worked end to end against
+   SQLite in the Durable Object.
+6. Deployed with `npm run deploy` to
+   https://job-search-copilot.aravinthm172.workers.dev, and updated
+   `README.md` (live URL, subdomain requirement, the streaming workaround)
+   and `.dev.vars.example` (wrangler reads the token from `.env`, not
+   `.dev.vars`).
