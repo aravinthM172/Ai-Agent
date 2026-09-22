@@ -12,6 +12,59 @@ import {
 import { z } from "zod";
 
 /**
+ * Workers AI streams for Llama 3.3 now send every delta twice per SSE chunk:
+ * once in OpenAI-style `choices[0].delta` and again in the legacy top-level
+ * `response` / `tool_calls` fields. workers-ai-provider 3.x reads both, which
+ * doubles text and corrupts streamed tool-call arguments (e.g.
+ * `{"summary": "{"summary": "BackendBackend ...`), so every tool call fails
+ * validation. This wraps the binding and drops the legacy fields whenever
+ * `choices` is present, leaving a single copy of each delta.
+ */
+function dedupeStreamChunks(ai: Ai): Ai {
+  const fixLine = (line: string) => {
+    if (!line.startsWith("data: ")) return line;
+    try {
+      const chunk = JSON.parse(line.slice(6));
+      if (!Array.isArray(chunk.choices)) return line;
+      delete chunk.response;
+      delete chunk.tool_calls;
+      return `data: ${JSON.stringify(chunk)}`;
+    } catch {
+      return line; // e.g. "data: [DONE]"
+    }
+  };
+
+  return new Proxy(ai, {
+    get(target, prop, receiver) {
+      if (prop !== "run") return Reflect.get(target, prop, receiver);
+      return async (...args: Parameters<Ai["run"]>) => {
+        const result: unknown = await target.run(...args);
+        if (!(result instanceof ReadableStream)) return result;
+
+        const decoder = new TextDecoder();
+        const encoder = new TextEncoder();
+        let buffer = "";
+        return result.pipeThrough(
+          new TransformStream<Uint8Array, Uint8Array>({
+            transform(bytes, controller) {
+              buffer += decoder.decode(bytes, { stream: true });
+              const lines = buffer.split("\n");
+              buffer = lines.pop() ?? "";
+              for (const line of lines) {
+                controller.enqueue(encoder.encode(`${fixLine(line)}\n`));
+              }
+            },
+            flush(controller) {
+              if (buffer) controller.enqueue(encoder.encode(fixLine(buffer)));
+            }
+          })
+        );
+      };
+    }
+  });
+}
+
+/**
  * JobSearchCopilot — an AI agent that helps track job applications and
  * compare job descriptions against a saved resume/profile.
  *
@@ -77,7 +130,9 @@ export class JobSearchCopilot extends AIChatAgent<Env> {
 
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     const mcpTools = this.mcp.getAITools();
-    const workersai = createWorkersAI({ binding: this.env.AI });
+    const workersai = createWorkersAI({
+      binding: dedupeStreamChunks(this.env.AI)
+    });
 
     const savedProfile = this.sql<{ summary: string }>`
       SELECT summary FROM resume_profile WHERE id = 1
@@ -146,7 +201,8 @@ answer as: matching keywords/skills, missing/weak areas, and one honest recommen
           }),
           execute: async ({ status }) => {
             const rows = status
-              ? this.sql`SELECT * FROM job_notes WHERE status = ${status} ORDER BY created_at DESC`
+              ? this
+                  .sql`SELECT * FROM job_notes WHERE status = ${status} ORDER BY created_at DESC`
               : this.sql`SELECT * FROM job_notes ORDER BY created_at DESC`;
             return rows.length ? rows : "No saved job notes yet.";
           }
