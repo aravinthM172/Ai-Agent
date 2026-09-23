@@ -28,6 +28,24 @@ export function wordOverlap(text: string, source: string): number {
   return textWords.filter((w) => sourceWords.has(w)).length / textWords.length;
 }
 
+/**
+ * The job description to analyze, taken from the user's own message rather
+ * than the model's copy. When retyping a pasted posting into a tool call the
+ * model can alter it (in testing, "TypeScript" became "Typecript"), which
+ * then skews the requirements and the score. Returns the model's text only
+ * if it is an exact excerpt of the user's message, the user's message if the
+ * model's text is a close copy of it, and null if it isn't from the user.
+ */
+export function groundedJobText(
+  modelText: string,
+  userText: string
+): string | null {
+  const squash = (s: string) => s.replace(/\s+/g, " ").trim();
+  if (squash(userText).includes(squash(modelText))) return modelText;
+  if (wordOverlap(modelText, userText) >= 0.5) return userText;
+  return null;
+}
+
 /** True if some identical tool call (name + input) appears more than once. */
 export function hasRepeatedToolCall<T extends ToolSet>(steps: StepResult<T>[]) {
   const seen = new Set<string>();

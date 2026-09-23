@@ -1,6 +1,7 @@
 import type { ModelMessage, StepResult, ToolSet } from "ai";
 import { describe, expect, it } from "vitest";
 import {
+  groundedJobText,
   hasRepeatedToolCall,
   summarizeToolResults,
   withoutToolParts,
@@ -46,6 +47,32 @@ function step(
     toolResults: calls.map(({ toolName, output }) => ({ toolName, output }))
   } as unknown as StepResult<ToolSet>;
 }
+
+describe("groundedJobText (model's copy of a pasted job)", () => {
+  const userMessage =
+    "Analyze this job posting: Stripe, Senior Backend Engineer. Requirements: 5+ years of backend experience, Go or TypeScript, PostgreSQL, Kubernetes, AWS.";
+
+  it("keeps the model's text when it is an exact excerpt", () => {
+    const excerpt =
+      "Requirements: 5+ years of backend experience, Go or TypeScript, PostgreSQL, Kubernetes, AWS.";
+    expect(groundedJobText(excerpt, userMessage)).toBe(excerpt);
+  });
+
+  it("uses the user's text when the model altered it (real typo from testing)", () => {
+    const altered =
+      "Requirements: 5+ years of backend experience, Go or Typecript, PostgreSQL, Kubernetes, AWS.";
+    expect(groundedJobText(altered, userMessage)).toBe(userMessage);
+  });
+
+  it("rejects text that isn't from the user's message", () => {
+    expect(
+      groundedJobText(
+        "Frontend developer role requiring React, Redux and GraphQL expertise.",
+        userMessage
+      )
+    ).toBeNull();
+  });
+});
 
 describe("hasRepeatedToolCall", () => {
   it("detects the same tool called with the same input", () => {

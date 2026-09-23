@@ -10,6 +10,7 @@ import {
 } from "ai";
 import { z } from "zod";
 import {
+  groundedJobText,
   hasRepeatedToolCall,
   summarizeToolResults,
   withoutToolParts,
@@ -218,6 +219,12 @@ export class JobSearchCopilot extends AIChatAgent<Env> {
       .slice(-3)
       .flatMap((m) => m.parts.map((p) => (p.type === "text" ? p.text : "")))
       .join(" ");
+    const lastUserText =
+      [...this.messages]
+        .reverse()
+        .find((m) => m.role === "user")
+        ?.parts.map((p) => (p.type === "text" ? p.text : ""))
+        .join(" ") ?? "";
 
     const savedProfile = this.getResumeProfile();
 
@@ -324,6 +331,9 @@ answer as: matching keywords/skills, missing/weak areas, and one honest recommen
             if (wordOverlap(summary, recentUserText) < 0.5) {
               return "Not saved: this doesn't look like the user's own resume text. Ask the user to paste their resume or a summary of their experience.";
             }
+            if (summary.trim() === savedProfile?.trim()) {
+              return "Already saved: this is the user's current resume profile, so nothing changed.";
+            }
             this.saveResumeProfile(summary);
             return "Resume profile saved.";
           }
@@ -360,7 +370,11 @@ answer as: matching keywords/skills, missing/weak areas, and one honest recommen
               .string()
               .describe("The full job description text, as pasted")
           }),
-          execute: async ({ company, role, jobDescription }) => {
+          execute: async ({ company, role, jobDescription: modelText }) => {
+            const jobDescription = groundedJobText(modelText, lastUserText);
+            if (!jobDescription) {
+              return "Not analyzed: this doesn't look like a job posting the user pasted. Ask the user to paste the full job posting text.";
+            }
             if (!this.getResumeProfile()) {
               return "No resume saved yet, so there is nothing to score against. Ask the user to paste their resume first.";
             }
