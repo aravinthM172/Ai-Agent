@@ -58,12 +58,7 @@ export class JobAnalysisWorkflow extends AgentWorkflow<
         retries: { limit: 3, delay: "5 seconds", backoff: "exponential" },
         timeout: "2 minutes"
       },
-      () =>
-        extractRequirements(this.env.AI, jobDescription, {
-          // Through AI Gateway: identical job descriptions are served from
-          // cache, and every call is logged/rate-limited in one place.
-          gateway: { id: this.env.AI_GATEWAY_ID, cacheTtl: 86400 }
-        })
+      () => extractRequirements(this.env, jobDescription)
     );
 
     await this.reportProgress({

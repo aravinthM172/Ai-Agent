@@ -1,4 +1,3 @@
-import { createWorkersAI } from "workers-ai-provider";
 import { callable, routeAgentRequest, type Schedule } from "agents";
 import { getSchedulePrompt, scheduleSchema } from "agents/schedule";
 import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
@@ -17,11 +16,8 @@ import {
   wordOverlap
 } from "./lib/guardrails";
 import type { JobRequirements, MatchResult } from "./lib/matching";
-import {
-  CHAT_MODEL,
-  fixWorkersAIBinding,
-  friendlyAIError
-} from "./lib/workers-ai";
+import { chatModel } from "./lib/llm";
+import { friendlyAIError } from "./lib/workers-ai";
 import type {
   JobAnalysisParams,
   JobAnalysisResult
@@ -213,19 +209,15 @@ export class JobSearchCopilot extends AIChatAgent<Env> {
 
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     const mcpTools = this.mcp.getAITools();
-    const workersai = createWorkersAI({
-      binding: fixWorkersAIBinding(this.env.AI),
-      // Every model call goes through AI Gateway for logging, analytics, and
-      // rate limiting in one place (Cloudflare dashboard → AI → AI Gateway).
-      gateway: { id: this.env.AI_GATEWAY_ID }
-    });
+    const model = chatModel(this.env, this.sessionAffinity);
 
-    const lastUserText =
-      [...this.messages]
-        .reverse()
-        .find((m) => m.role === "user")
-        ?.parts.map((p) => (p.type === "text" ? p.text : ""))
-        .join(" ") ?? "";
+    // The user's last few messages, so "save that resume" can refer to text
+    // pasted a message or two earlier.
+    const recentUserText = this.messages
+      .filter((m) => m.role === "user")
+      .slice(-3)
+      .flatMap((m) => m.parts.map((p) => (p.type === "text" ? p.text : "")))
+      .join(" ");
 
     const savedProfile = this.getResumeProfile();
 
@@ -236,7 +228,7 @@ export class JobSearchCopilot extends AIChatAgent<Env> {
     });
 
     const result = streamText({
-      model: workersai(CHAT_MODEL, { sessionAffinity: this.sessionAffinity }),
+      model,
       system: `You are Job Search Copilot, an assistant that helps a candidate manage their job search.
 
 You can:
@@ -328,8 +320,8 @@ answer as: matching keywords/skills, missing/weak areas, and one honest recommen
           }),
           execute: async ({ summary }) => {
             // Refuse summaries the model made up: most of the summary's words
-            // must come from what the user just wrote.
-            if (wordOverlap(summary, lastUserText) < 0.5) {
+            // must come from what the user wrote in their last few messages.
+            if (wordOverlap(summary, recentUserText) < 0.5) {
               return "Not saved: this doesn't look like the user's own resume text. Ask the user to paste their resume or a summary of their experience.";
             }
             this.saveResumeProfile(summary);

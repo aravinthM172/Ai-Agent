@@ -4,3 +4,8 @@
 # Needed for `npm run dev` (Workers AI has no local simulator, so dev mode
 # proxies to your real Cloudflare account) and for `npm run deploy`.
 CLOUDFLARE_API_TOKEN=your-api-token-here
+
+# Optional, and goes in .dev.vars (runtime secret for the Worker): a free Groq
+# key from https://console.groq.com/keys. When set, the app uses Llama 3.3 on
+# Groq instead of Workers AI. In production: npx wrangler secret put GROQ_API_KEY
+# GROQ_API_KEY=your-groq-key-here

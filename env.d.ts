@@ -4,6 +4,7 @@
 interface __BaseEnv_Env {
 	AI: Ai;
 	AI_GATEWAY_ID: "default";
+	GROQ_API_KEY?: string;
 	JobSearchCopilot: DurableObjectNamespace<import("./src/server").JobSearchCopilot>;
 	JOB_ANALYSIS_WORKFLOW: Workflow<Parameters<import("./src/server").JobAnalysisWorkflow['run']>[0]['payload']>;
 }

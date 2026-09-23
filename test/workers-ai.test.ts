@@ -110,6 +110,11 @@ describe("friendlyAIError", () => {
       /Too many requests/
     );
     expect(friendlyAIError("Request timed out")).toMatch(/too long/);
+    expect(
+      friendlyAIError(
+        "Groq 429: Rate limit reached for model `openai/gpt-oss-120b` on tokens per day (TPD): Limit 100000, Used 99980"
+      )
+    ).toMatch(/daily limit/);
   });
 
   it("never leaks raw error details", () => {

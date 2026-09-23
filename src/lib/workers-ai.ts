@@ -76,7 +76,7 @@ function dedupeSSELine(line: string) {
 }
 
 /**
- * Turns a Workers AI / AI Gateway error into a message that is safe and
+ * Turns a Workers AI / Groq / AI Gateway error into a message that is safe and
  * useful to show in the chat. The AI SDK otherwise shows only
  * "An error occurred.", which gives the user nothing to act on.
  */
@@ -88,6 +88,11 @@ export function friendlyAIError(error: unknown): string {
   );
   if (/4006|daily free allocation|neurons/i.test(text)) {
     return "The AI model's free daily limit on this Cloudflare account has been reached. It resets at 00:00 UTC (5:30 AM IST). Your saved jobs and resume are safe; please try again after the reset.";
+  }
+  // Groq's free tier also has daily token/request caps (TPD / RPD), reported
+  // as a 429 "Rate limit reached ... per day".
+  if (/per day|(TPD|RPD)/i.test(text)) {
+    return "The AI model's free daily limit has been reached. Please try again later; your saved jobs and resume are safe.";
   }
   if (/rate.?limit|429|too many requests/i.test(text)) {
     return "Too many requests right now. Please wait a few seconds and try again.";

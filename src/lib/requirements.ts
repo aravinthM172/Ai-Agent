@@ -5,6 +5,7 @@
  */
 import { z } from "zod";
 import type { JobRequirements } from "./matching";
+import { GROQ_BASE_URL, GROQ_MODEL, usesGroq } from "./llm";
 import { CHAT_MODEL } from "./workers-ai";
 
 export const jobRequirementsSchema = z.object({
@@ -46,31 +47,74 @@ Return JSON only, matching the schema.
 - summary: one or two sentences describing the role.
 Only include what the text actually says. Do not invent requirements.`;
 
-/** Asks Llama 3.3 (JSON mode) for the job's requirements and validates them. */
+// Workers AI only: identical job descriptions are served from AI Gateway's
+// cache for 24h.
+const CACHE_TTL_SECONDS = 86400;
+
+/**
+ * Asks the LLM (JSON mode) for the job's requirements and validates them.
+ * Uses Groq when GROQ_API_KEY is set, otherwise Llama 3.3 on Workers AI.
+ */
 export async function extractRequirements(
-  ai: Ai,
-  jobDescription: string,
-  options?: AiOptions
+  env: Env,
+  jobDescription: string
 ): Promise<JobRequirements> {
-  const result = (await ai.run(
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: jobDescription.slice(0, 12000) }
+  ];
+  if (usesGroq(env)) return parseRequirements(await callGroq(env, messages));
+  const result = (await env.AI.run(
     CHAT_MODEL,
     {
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: jobDescription.slice(0, 12000) }
-      ],
+      messages,
       response_format: RESPONSE_FORMAT,
       temperature: 0,
       max_tokens: 800
     } as never,
-    options
+    { gateway: { id: env.AI_GATEWAY_ID, cacheTtl: CACHE_TTL_SECONDS } }
   )) as unknown;
   return parseRequirements(result);
 }
 
 /**
- * Validates a Workers AI JSON-mode result. Depending on the model/API
- * version, the JSON arrives as an object in `response`, as a string in
+ * Groq's JSON mode here is `json_object` (no schema enforcement),
+ * so the schema is spelled out in the system prompt and zod validates it.
+ */
+async function callGroq(
+  env: Env,
+  messages: { role: string; content: string }[]
+): Promise<unknown> {
+  const response = await fetch(`${GROQ_BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.GROQ_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages: [
+        {
+          ...messages[0],
+          content: `${messages[0].content}
+The JSON object must have exactly these keys: ${JSON.stringify(RESPONSE_FORMAT.json_schema.properties)}`
+        },
+        ...messages.slice(1)
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0,
+      max_tokens: 800
+    })
+  });
+  if (!response.ok) {
+    throw new Error(`Groq ${response.status}: ${await response.text()}`);
+  }
+  return response.json();
+}
+
+/**
+ * Validates a JSON-mode result. Depending on the provider/API version, the
+ * JSON arrives as an object in `response`, as a string in
  * `response`, or in OpenAI-style `choices[0].message.content`.
  */
 export function parseRequirements(result: unknown): JobRequirements {
